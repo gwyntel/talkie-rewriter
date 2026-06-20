@@ -1,0 +1,20 @@
+name: talkie-rewriter
+version: 1.0.0
+description: "Rewrite LLM responses through a style-flavored finetune model (Talkie-1930-13B). Optional Qwen3Guard moderation. Settable system prompt, generation params, and context depth via tools."
+author: GwynTel
+kind: standalone
+hooks:
+  - pre_llm_call
+  - transform_llm_output
+requires_env:
+  - name: TALKIE_API_KEY
+    description: "API key for the Talkie rewriter model (separate from host key)"
+    secret: true
+pip_dependencies:
+  - openai
+provides_tools:
+  - talkie_set_system_prompt
+  - talkie_set_param
+  - talkie_toggle_moderation
+  - talkie_set_context_depth
+  - talkie_get_config

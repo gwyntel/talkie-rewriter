@@ -24,12 +24,24 @@ def _build_messages(
 ) -> List[Dict[str, str]]:
     """Build chat messages for the rewriter LLM call.
 
+    The Talkie finetune model does not support the 'system' role, so the
+    system prompt is folded into the first user message.
+
     Structure:
-      [system_prompt]
       [last N user+assistant messages for context]
-      [user: rewrite instruction + original output]
+      [user: system_prompt + rewrite instruction + original output]
     """
-    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    # Prepend the system prompt to the rewrite instruction
+    rewrite_instruction = (
+        f"{system_prompt}\n\n"
+        "Rewrite the following response in your own voice and style. "
+        "Preserve all factual content, technical accuracy, and formatting. "
+        "Do not add information that wasn't in the original. "
+        "Output ONLY the rewritten text with no preamble or explanation.\n\n"
+        f"{original_output}"
+    )
+
+    messages: List[Dict[str, str]] = []
 
     # Add context messages (already truncated to N by caller)
     for msg in context_messages:
@@ -38,17 +50,8 @@ def _build_messages(
         if role in ("user", "assistant") and content:
             messages.append({"role": role, "content": content})
 
-    # The rewrite instruction
-    messages.append({
-        "role": "user",
-        "content": (
-            "Rewrite the following response in your own voice and style. "
-            "Preserve all factual content, technical accuracy, and formatting. "
-            "Do not add information that wasn't in the original. "
-            "Output ONLY the rewritten text with no preamble or explanation.\n\n"
-            f"{original_output}"
-        ),
-    })
+    # The rewrite instruction (with system prompt folded in)
+    messages.append({"role": "user", "content": rewrite_instruction})
 
     return messages
 

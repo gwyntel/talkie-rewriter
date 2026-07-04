@@ -72,9 +72,14 @@ def _get_stashed_messages(session_id: str) -> List[Dict[str, str]]:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+_base_config_cache = None
+
 def _get_effective_config(session_id: str) -> TalkieRewriterConfig:
     """Return config with runtime overrides applied for this session."""
-    config = get_config()
+    global _base_config_cache
+    if _base_config_cache is None:
+        _base_config_cache = get_config()
+    config = _base_config_cache
     state = _get_state(session_id)
 
     # Create a shallow copy to overlay overrides
@@ -106,6 +111,12 @@ def _get_effective_config(session_id: str) -> TalkieRewriterConfig:
 def register(ctx) -> None:
     """Called by the Hermes plugin loader. Registers hooks + tools."""
 
+    # Pre-cache config ONCE at registration time so hooks never call
+    # load_config() during the agent loop (which can interfere with
+    # the OpenAI client / model call state).
+    _base_config = get_config()
+    _base_context_n = _base_config.context_messages
+
     # ════════════════════════════════════════════════════════════════════════
     # HOOK: pre_llm_call — stash conversation history
     # ════════════════════════════════════════════════════════════════════════
@@ -119,8 +130,8 @@ def register(ctx) -> None:
         if not session_id:
             return None
 
-        config = get_config()
-        n = config.context_messages
+        # Use pre-cached value — never call get_config() / load_config() here
+        n = _base_context_n
 
         # Extract recent user+assistant messages from conversation history
         recent = []
@@ -199,7 +210,7 @@ def register(ctx) -> None:
             original_output=response_text,
             config=config,
             system_prompt_override=(
-                config.system_prompt if config.system_prompt != get_config().system_prompt else None
+                config.system_prompt if _base_config is not None and config.system_prompt != _base_config.system_prompt else None
             ),
             context_messages=context_messages,
         )

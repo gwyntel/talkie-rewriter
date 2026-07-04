@@ -17,7 +17,7 @@ logger = logging.getLogger("hermes.plugins.talkie-rewriter")
 # ── Defaults ────────────────────────────────────────────────────────────────
 
 DEFAULT_BASE_URL = "https://plexus.nebulosa-bass.ts.net/v1"
-DEFAULT_MODEL = "talkie-lm/talkie-1930-13b-it"
+DEFAULT_MODEL = "Qwen/Qwen3.6-35B-A3B"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a response rewriter. Rewrite the following text in your own voice "
     "and style. Preserve all factual content, technical accuracy, and formatting. "
@@ -45,7 +45,7 @@ DEFAULT_MOD_ACTION = "block"  # "block" or "flag"
 # Verification defaults
 DEFAULT_VERIFY_ENABLED = True
 DEFAULT_VERIFY_MODEL = "glm.short.fast"  # fast, cheap model via Plexus
-DEFAULT_VERIFY_MAX_RETRIES = 1  # max rewrite attempts after initial try
+DEFAULT_VERIFY_MAX_RETRIES = 5  # max rewrite attempts after initial try
 DEFAULT_VERIFY_TIMEOUT = 30
 
 _ENV_REF_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")

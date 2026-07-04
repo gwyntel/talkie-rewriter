@@ -41,10 +41,27 @@ DEFAULT_MOD_BLOCK_THRESHOLD = "high"  # "medium" or "high"
 DEFAULT_MOD_ACTION = "block"  # "block" or "flag"
 
 
+def _ensure_env_loaded() -> None:
+    """Load .env file if not already loaded (Hermes loads it at agent init,
+    but plugin config may be read before that if ctx calls load_config() directly)."""
+    if os.getenv("_TALKIE_ENV_LOADED"):
+        return
+    os.environ["_TALKIE_ENV_LOADED"] = "1"
+    try:
+        from dotenv import load_dotenv
+        hermes_home = os.path.expanduser("~/.hermes")
+        env_path = os.path.join(hermes_home, ".env")
+        if os.path.exists(env_path):
+            load_dotenv(env_path, override=False)
+    except Exception:
+        pass
+
+
 class TalkieRewriterConfig:
     """Parsed configuration for the talkie-rewriter plugin."""
 
     def __init__(self, raw: Optional[Dict[str, Any]] = None):
+        _ensure_env_loaded()
         raw = raw or {}
 
         # ── Rewriter LLM ──

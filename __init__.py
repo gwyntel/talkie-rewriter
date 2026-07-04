@@ -128,9 +128,8 @@ def register(ctx) -> None:
         if not session_id:
             return None
 
-        # Lazy-load config on first call (safe — agent is fully initialized)
-        config = _get_effective_config(session_id)
-        n = config.context_messages
+        # Use hardcoded default — config loading deferred to transform hook
+        n = 4
 
         # Extract recent user+assistant messages from conversation history
         recent = []

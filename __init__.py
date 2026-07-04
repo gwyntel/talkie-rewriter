@@ -111,11 +111,9 @@ def _get_effective_config(session_id: str) -> TalkieRewriterConfig:
 def register(ctx) -> None:
     """Called by the Hermes plugin loader. Registers hooks + tools."""
 
-    # Pre-cache config ONCE at registration time so hooks never call
-    # load_config() during the agent loop (which can interfere with
-    # the OpenAI client / model call state).
-    _base_config = get_config()
-    _base_context_n = _base_config.context_messages
+    # Config is loaded LAZILY on first hook invocation, NOT at register()
+    # time. Calling get_config() / load_config() here interferes with the
+    # agent's auth initialization and causes the model API call to hang.
 
     # ════════════════════════════════════════════════════════════════════════
     # HOOK: pre_llm_call — stash conversation history
@@ -130,8 +128,9 @@ def register(ctx) -> None:
         if not session_id:
             return None
 
-        # Use pre-cached value — never call get_config() / load_config() here
-        n = _base_context_n
+        # Lazy-load config on first call (safe — agent is fully initialized)
+        config = _get_effective_config(session_id)
+        n = config.context_messages
 
         # Extract recent user+assistant messages from conversation history
         recent = []
@@ -206,12 +205,13 @@ def register(ctx) -> None:
                 )
 
         # ── Step 2: Rewrite through Talkie model ──
+        # system_prompt_override is only passed if the runtime override changed it
+        # from the base config. Since config already has overrides applied, we
+        # compare against a fresh base load.
         rewritten = rewrite_response(
             original_output=response_text,
             config=config,
-            system_prompt_override=(
-                config.system_prompt if _base_config is not None and config.system_prompt != _base_config.system_prompt else None
-            ),
+            system_prompt_override=config.system_prompt,
             context_messages=context_messages,
         )
 

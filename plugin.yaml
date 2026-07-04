@@ -16,5 +16,6 @@ provides_tools:
   - talkie_set_system_prompt
   - talkie_set_param
   - talkie_toggle_moderation
+  - talkie_toggle_verification
   - talkie_set_context_depth
   - talkie_get_config

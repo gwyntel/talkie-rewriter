@@ -42,6 +42,12 @@ DEFAULT_MOD_MODEL = "Qwen/Qwen3Guard-Gen-4B"
 DEFAULT_MOD_BLOCK_THRESHOLD = "high"  # "medium" or "high"
 DEFAULT_MOD_ACTION = "block"  # "block" or "flag"
 
+# Verification defaults
+DEFAULT_VERIFY_ENABLED = True
+DEFAULT_VERIFY_MODEL = "glm.short.fast"  # fast, cheap model via Plexus
+DEFAULT_VERIFY_MAX_RETRIES = 1  # max rewrite attempts after initial try
+DEFAULT_VERIFY_TIMEOUT = 30
+
 _ENV_REF_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 _dotenv_loaded = False
 _dotenv_lock = threading.Lock()
@@ -135,6 +141,23 @@ class TalkieRewriterConfig:
         self.mod_block_threshold: str = _get_raw(mod_raw, "block_threshold", DEFAULT_MOD_BLOCK_THRESHOLD)
         self.mod_action: str = _get_raw(mod_raw, "action", DEFAULT_MOD_ACTION)
 
+        # ── Verification (post-rewrite sanity check) ──
+        verify_raw = raw.get("verification", {}) or {}
+        self.verify_enabled: bool = verify_raw.get("enabled", DEFAULT_VERIFY_ENABLED)
+        self.verification_model: str = _get_raw(verify_raw, "model", DEFAULT_VERIFY_MODEL)
+        # Verification uses the host's Plexus key by default (separate from Talkie key)
+        _verify_api_key = _get_raw(verify_raw, "api_key", os.getenv("PLEXUS_API_KEY", ""))
+        self.verification_api_key: str = _verify_api_key or os.getenv("PLEXUS_API_KEY", "")
+        self.verification_base_url: str = _get_raw(
+            verify_raw, "base_url", os.getenv("PLEXUS_BASE_URL", DEFAULT_BASE_URL)
+        )
+        self.verify_max_retries: int = int(
+            verify_raw.get("max_retries", DEFAULT_VERIFY_MAX_RETRIES)
+        )
+        self.verification_timeout: int = int(
+            verify_raw.get("timeout", DEFAULT_VERIFY_TIMEOUT)
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize config to a dict (for talkie_get_config tool and logging)."""
         return {
@@ -156,6 +179,13 @@ class TalkieRewriterConfig:
                 "base_url": self.mod_base_url,
                 "block_threshold": self.mod_block_threshold,
                 "action": self.mod_action,
+            },
+            "verification": {
+                "enabled": self.verify_enabled,
+                "model": self.verification_model,
+                "base_url": self.verification_base_url,
+                "max_retries": self.verify_max_retries,
+                "timeout": self.verification_timeout,
             },
         }
 

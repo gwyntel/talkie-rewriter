@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 from .config import TalkieRewriterConfig, get_config
 from .rewriter import rewrite_response
 from .moderator import moderate_response
+from .verifier import verify_rewrite
 
 logger = logging.getLogger("hermes.plugins.talkie-rewriter")
 
@@ -45,6 +46,7 @@ def _new_state() -> Dict[str, Any]:
     return {
         "last_messages": [],
         "mod_enabled": None,  # None = use config default
+        "verify_enabled": None,  # None = use config default
         "system_prompt_override": None,  # None = use config default
         "param_overrides": {},  # {param_name: value}
         "context_depth_override": None,  # None = use config default
@@ -66,6 +68,7 @@ def _get_state_snapshot(session_id: str) -> Dict[str, Any]:
         return {
             "last_messages": [dict(msg) for msg in state.get("last_messages", [])],
             "mod_enabled": state.get("mod_enabled"),
+            "verify_enabled": state.get("verify_enabled"),
             "system_prompt_override": state.get("system_prompt_override"),
             "param_overrides": dict(state.get("param_overrides", {})),
             "context_depth_override": state.get("context_depth_override"),
@@ -120,6 +123,9 @@ def _get_effective_config(session_id: str) -> TalkieRewriterConfig:
 
     if state.get("mod_enabled") is not None:
         effective.mod_enabled = state["mod_enabled"]
+
+    if state.get("verify_enabled") is not None:
+        effective.verify_enabled = state["verify_enabled"]
 
     if state.get("context_depth_override") is not None:
         effective.context_messages = state["context_depth_override"]
@@ -235,7 +241,8 @@ def register(ctx) -> None:
                     mod_result.get("error"),
                 )
 
-        # ── Step 2: Rewrite through Talkie model ──
+        # ── Step 2: Rewrite through Talkie model (with verify-retry loop) ──
+        max_retries = config.verify_max_retries if config.verify_enabled else 0
         rewritten = rewrite_response(
             original_output=response_text,
             config=config,
@@ -254,7 +261,65 @@ def register(ctx) -> None:
             # Model returned identical text — no flag needed
             return None
 
-        # ── Step 3: Prepend flag ──
+        # ── Step 3: Verification (if enabled) ──
+        if config.verify_enabled:
+            from .verifier import verify_rewrite as _verify
+
+            attempt = 0
+            current_output = rewritten
+
+            while attempt <= max_retries:
+                passed, reason = _verify(
+                    original_output=response_text,
+                    rewritten_output=current_output,
+                    context_messages=context_messages,
+                    config=config,
+                )
+
+                if passed:
+                    break
+
+                # Verification failed — retry if we have attempts left
+                if attempt >= max_retries:
+                    logger.info(
+                        "talkie-rewriter: verification failed after %d retries — "
+                        "accepting last output. Reason: %s",
+                        max_retries, reason,
+                    )
+                    break
+
+                # Build retry hint for stronger direction
+                retry_hint = (
+                    f"Your previous output was checked and appeared to reply to "
+                    f"the original text instead of rewriting it for the user. "
+                    f"Issue: {reason}. "
+                    f"Please rewrite again, making sure you are responding directly "
+                    f"to the user, not commenting on or replying to the source text."
+                )
+
+                logger.info(
+                    "talkie-rewriter: verification retry %d/%d — %s",
+                    attempt + 1, max_retries, reason,
+                )
+
+                retry_output = rewrite_response(
+                    original_output=response_text,
+                    config=config,
+                    context_messages=context_messages,
+                    retry_hint=retry_hint,
+                )
+
+                if retry_output is None or retry_output.strip() == response_text.strip():
+                    # Retry failed — keep the previous output
+                    logger.info("talkie-rewriter: retry %d produced no new output, keeping previous", attempt + 1)
+                    break
+
+                current_output = retry_output
+                attempt += 1
+
+            rewritten = current_output
+
+        # ── Step 4: Prepend flag ──
         flag = config.flag_template
         return f"{flag}\n\n{rewritten}"
 
@@ -432,6 +497,59 @@ def register(ctx) -> None:
     )
 
     # ════════════════════════════════════════════════════════════════════════
+    # TOOL: talkie_toggle_verification
+    # ════════════════════════════════════════════════════════════════════════
+
+    def _talkie_toggle_verification_handler(args, **kwargs) -> str:
+        session_id = kwargs.get("session_id", "")
+        enabled = args.get("enabled", True)
+
+        state = _get_state(session_id)
+        with _state_lock:
+            state["verify_enabled"] = bool(enabled)
+
+        logger.info(
+            "talkie-rewriter: verification %s (session %s)",
+            "enabled" if enabled else "disabled",
+            session_id,
+        )
+        return json.dumps({
+            "success": True,
+            "verification_enabled": bool(enabled),
+        })
+
+    ctx.register_tool(
+        name="talkie_toggle_verification",
+        toolset="talkie-rewriter",
+        schema={
+            "name": "talkie_toggle_verification",
+            "description": (
+                "Enable or disable the post-rewrite verification pass. "
+                "When enabled, a second LLM checks that the rewritten output "
+                "addresses the user's message rather than replying to the original "
+                "AI output. If verification fails, the rewrite is retried up to "
+                "max_retries times. Changes apply to the current session."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "True to enable verification, False to disable.",
+                    },
+                },
+                "required": ["enabled"],
+            },
+        },
+        handler=_talkie_toggle_verification_handler,
+        check_fn=lambda: True,
+        requires_env=[],
+        is_async=False,
+        description="Toggle post-rewrite verification on/off",
+        emoji="🔍",
+    )
+
+    # ════════════════════════════════════════════════════════════════════════
     # TOOL: talkie_set_context_depth
     # ════════════════════════════════════════════════════════════════════════
 
@@ -491,10 +609,12 @@ def register(ctx) -> None:
         session_id = kwargs.get("session_id", "")
         config = _get_effective_config(session_id)
         cfg_dict = config.to_dict()
-        # Don't expose the API key
+        # Don't expose API keys
         cfg_dict.pop("api_key", None)
         mod = cfg_dict.get("moderation", {})
         mod.pop("api_key", None) if isinstance(mod, dict) else None
+        verify = cfg_dict.get("verification", {})
+        verify.pop("api_key", None) if isinstance(verify, dict) else None
         return json.dumps({"success": True, "config": cfg_dict}, indent=2, ensure_ascii=False)
 
     ctx.register_tool(
@@ -530,4 +650,4 @@ def register(ctx) -> None:
     logger.info("talkie-rewriter plugin registered (hooks: pre_llm_call, transform_llm_output)")
     logger.info("talkie-rewriter tools registered: talkie_set_system_prompt, "
                 "talkie_set_param, talkie_toggle_moderation, "
-                "talkie_set_context_depth, talkie_get_config")
+                "talkie_toggle_verification, talkie_set_context_depth, talkie_get_config")

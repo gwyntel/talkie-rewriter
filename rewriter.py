@@ -21,6 +21,7 @@ def _build_messages(
     original_output: str,
     system_prompt: str,
     context_messages: List[Dict[str, str]],
+    retry_hint: Optional[str] = None,
 ) -> List[Dict[str, str]]:
     """Build chat messages for the rewriter LLM call.
 
@@ -30,6 +31,7 @@ def _build_messages(
     Structure:
       [last N user+assistant messages for context]
       [user: system_prompt + rewrite instruction + original output]
+      [if retry: additional user message with stronger direction]
     """
     # Prepend the system prompt to the rewrite instruction
     rewrite_instruction = (
@@ -53,6 +55,10 @@ def _build_messages(
     # The rewrite instruction (with system prompt folded in)
     messages.append({"role": "user", "content": rewrite_instruction})
 
+    # On retry, add a stronger direction message
+    if retry_hint:
+        messages.append({"role": "user", "content": retry_hint})
+
     return messages
 
 
@@ -61,11 +67,16 @@ def rewrite_response(
     config: Optional[TalkieRewriterConfig] = None,
     system_prompt_override: Optional[str] = None,
     context_messages: Optional[List[Dict[str, str]]] = None,
+    retry_hint: Optional[str] = None,
 ) -> Optional[str]:
     """Call the Talkie model to rewrite a response.
 
     Returns the rewritten text on success, or None on failure (caller should
     fail-open and pass through the original).
+
+    Args:
+        retry_hint: If provided (on retry attempts), appended to the rewrite
+            instruction to steer the model away from the failure mode.
     """
     config = config or get_config()
     system_prompt = system_prompt_override or config.system_prompt
@@ -75,7 +86,7 @@ def rewrite_response(
         logger.warning("talkie-rewriter: TALKIE_API_KEY not configured — skipping rewrite")
         return None
 
-    messages = _build_messages(original_output, system_prompt, context)
+    messages = _build_messages(original_output, system_prompt, context, retry_hint)
 
     try:
         from openai import OpenAI

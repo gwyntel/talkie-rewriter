@@ -90,15 +90,24 @@ def rewrite_response(
             timeout=config.timeout,
         )
 
-        response = client.chat.completions.create(
+        # Build kwargs dynamically — some backends reject unknown params
+        # (e.g. Talkie finetune endpoint returns 422 for frequency_penalty
+        # and presence_penalty). Only include params we know are set.
+        create_kwargs: dict[str, Any] = dict(
             model=config.model,
             messages=messages,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
             top_p=config.top_p,
-            frequency_penalty=config.frequency_penalty,
-            presence_penalty=config.presence_penalty,
         )
+        # Only pass penalty params if they're non-zero — many finetune
+        # endpoints reject them as extra_forbidden.
+        if config.frequency_penalty:
+            create_kwargs["frequency_penalty"] = config.frequency_penalty
+        if config.presence_penalty:
+            create_kwargs["presence_penalty"] = config.presence_penalty
+
+        response = client.chat.completions.create(**create_kwargs)
 
         content = response.choices[0].message.content
         if content and content.strip():

@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import threading
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.talkie-rewriter")
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 
-DEFAULT_BASE_URL = os.getenv("PLEXUS_BASE_URL", "https://plexus.nebulosa-bass.ts.net/v1")
+DEFAULT_BASE_URL = "https://plexus.nebulosa-bass.ts.net/v1"
 DEFAULT_MODEL = "talkie-lm/talkie-1930-13b-it"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a response rewriter. Rewrite the following text in your own voice "
@@ -40,41 +42,76 @@ DEFAULT_MOD_MODEL = "Qwen/Qwen3Guard-Gen-4B"
 DEFAULT_MOD_BLOCK_THRESHOLD = "high"  # "medium" or "high"
 DEFAULT_MOD_ACTION = "block"  # "block" or "flag"
 
+_ENV_REF_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+_dotenv_loaded = False
+_dotenv_lock = threading.Lock()
 
-def _ensure_env_loaded() -> None:
-    """Load .env file if not already loaded (Hermes loads it at agent init,
-    but plugin config may be read before that if ctx calls load_config() directly)."""
-    if os.getenv("_TALKIE_ENV_LOADED"):
+
+def _load_dotenv_once() -> None:
+    """Load Hermes' .env lazily before resolving plugin env references.
+
+    Hermes startup normally loads ~/.hermes/.env, but plugin code can be
+    imported/registered before that happens in some paths.  This function is
+    called only from lazy config construction, never from register().
+    """
+    global _dotenv_loaded
+    if _dotenv_loaded:
         return
-    os.environ["_TALKIE_ENV_LOADED"] = "1"
-    try:
-        from dotenv import load_dotenv
-        hermes_home = os.path.expanduser("~/.hermes")
-        env_path = os.path.join(hermes_home, ".env")
-        if os.path.exists(env_path):
-            load_dotenv(env_path, override=False)
-    except Exception:
-        pass
+
+    with _dotenv_lock:
+        if _dotenv_loaded:
+            return
+
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+
+            load_hermes_dotenv()
+        except Exception:
+            try:
+                from dotenv import load_dotenv
+
+                env_path = os.path.join(os.path.expanduser("~/.hermes"), ".env")
+                if os.path.exists(env_path):
+                    load_dotenv(env_path, override=False)
+            except Exception as exc:
+                logger.debug("talkie-rewriter: .env lazy-load skipped: %s", exc)
+
+        _dotenv_loaded = True
+
+
+def _resolve_env_ref(value: Any, default: Any = None) -> Any:
+    """Resolve exact ``${VAR}`` config values against ``os.environ``."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        match = _ENV_REF_PATTERN.match(value.strip())
+        if match:
+            return os.getenv(match.group(1), "")
+    return value
+
+
+def _get_raw(raw: Dict[str, Any], key: str, default: Any) -> Any:
+    """Get a raw config value and resolve exact env-var references."""
+    return _resolve_env_ref(raw.get(key, default), default)
 
 
 class TalkieRewriterConfig:
     """Parsed configuration for the talkie-rewriter plugin."""
 
     def __init__(self, raw: Optional[Dict[str, Any]] = None):
-        _ensure_env_loaded()
+        _load_dotenv_once()
         raw = raw or {}
 
         # ── Rewriter LLM ──
         env_key = os.getenv("TALKIE_API_KEY", "")
-        self.api_key: str = raw.get("api_key", env_key)
-        # Resolve ${VAR} style refs
-        if self.api_key and self.api_key.startswith("${") and self.api_key.endswith("}"):
-            var_name = self.api_key[2:-1]
-            self.api_key = os.getenv(var_name, "")
-
-        self.base_url: str = raw.get("base_url", DEFAULT_BASE_URL)
-        self.model: str = raw.get("model", DEFAULT_MODEL)
-        self.system_prompt: str = raw.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+        self.api_key: str = _get_raw(raw, "api_key", env_key)
+        self.base_url: str = _get_raw(
+            raw,
+            "base_url",
+            os.getenv("PLEXUS_BASE_URL", DEFAULT_BASE_URL),
+        )
+        self.model: str = _get_raw(raw, "model", DEFAULT_MODEL)
+        self.system_prompt: str = _get_raw(raw, "system_prompt", DEFAULT_SYSTEM_PROMPT)
         self.temperature: float = raw.get("temperature", DEFAULT_TEMPERATURE)
         self.max_tokens: int = raw.get("max_tokens", DEFAULT_MAX_TOKENS)
         self.top_p: float = raw.get("top_p", DEFAULT_TOP_P)
@@ -86,20 +123,17 @@ class TalkieRewriterConfig:
         self.context_messages: int = raw.get("context_messages", DEFAULT_CONTEXT_MESSAGES)
 
         # ── Flag ──
-        self.flag_template: str = raw.get("flag_template", DEFAULT_FLAG_TEMPLATE)
+        self.flag_template: str = _get_raw(raw, "flag_template", DEFAULT_FLAG_TEMPLATE)
         self.fail_open: bool = raw.get("fail_open", DEFAULT_FAIL_OPEN)
 
         # ── Moderation ──
         mod_raw = raw.get("moderation", {}) or {}
         self.mod_enabled: bool = mod_raw.get("enabled", DEFAULT_MOD_ENABLED)
-        self.mod_model: str = mod_raw.get("model", DEFAULT_MOD_MODEL)
-        self.mod_api_key: str = mod_raw.get("api_key", self.api_key) or self.api_key
-        if self.mod_api_key and self.mod_api_key.startswith("${") and self.mod_api_key.endswith("}"):
-            var_name = self.mod_api_key[2:-1]
-            self.mod_api_key = os.getenv(var_name, "")
-        self.mod_base_url: str = mod_raw.get("base_url", self.base_url)
-        self.mod_block_threshold: str = mod_raw.get("block_threshold", DEFAULT_MOD_BLOCK_THRESHOLD)
-        self.mod_action: str = mod_raw.get("action", DEFAULT_MOD_ACTION)
+        self.mod_model: str = _get_raw(mod_raw, "model", DEFAULT_MOD_MODEL)
+        self.mod_api_key: str = _get_raw(mod_raw, "api_key", self.api_key) or self.api_key
+        self.mod_base_url: str = _get_raw(mod_raw, "base_url", self.base_url)
+        self.mod_block_threshold: str = _get_raw(mod_raw, "block_threshold", DEFAULT_MOD_BLOCK_THRESHOLD)
+        self.mod_action: str = _get_raw(mod_raw, "action", DEFAULT_MOD_ACTION)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize config to a dict (for talkie_get_config tool and logging)."""

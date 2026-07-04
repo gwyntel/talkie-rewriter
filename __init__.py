@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import json
 import logging
+import copy
 import threading
 from typing import Any, Dict, List, Optional
 
-from .config import TalkieRewriterConfig, get_config, reload_config
+from .config import TalkieRewriterConfig, get_config
 from .rewriter import rewrite_response
 from .moderator import moderate_response
 
@@ -36,35 +37,68 @@ logger = logging.getLogger("hermes.plugins.talkie-rewriter")
 
 # {session_id: {"last_messages": [...], "mod_enabled": bool}}
 _session_state: Dict[str, Dict[str, Any]] = {}
-_state_lock = threading.Lock()
+_state_lock = threading.RLock()
+
+
+def _new_state() -> Dict[str, Any]:
+    """Return a fresh session-state dictionary."""
+    return {
+        "last_messages": [],
+        "mod_enabled": None,  # None = use config default
+        "system_prompt_override": None,  # None = use config default
+        "param_overrides": {},  # {param_name: value}
+        "context_depth_override": None,  # None = use config default
+    }
 
 
 def _get_state(session_id: str) -> Dict[str, Any]:
     """Get or create session state."""
     with _state_lock:
         if session_id not in _session_state:
-            _session_state[session_id] = {
-                "last_messages": [],
-                "mod_enabled": None,  # None = use config default
-                "system_prompt_override": None,  # None = use config default
-                "param_overrides": {},  # {param_name: value}
-                "context_depth_override": None,  # None = use config default
-            }
+            _session_state[session_id] = _new_state()
         return _session_state[session_id]
+
+
+def _get_state_snapshot(session_id: str) -> Dict[str, Any]:
+    """Return a shallow, mutation-safe snapshot of session state."""
+    with _state_lock:
+        state = _get_state(session_id)
+        return {
+            "last_messages": [dict(msg) for msg in state.get("last_messages", [])],
+            "mod_enabled": state.get("mod_enabled"),
+            "system_prompt_override": state.get("system_prompt_override"),
+            "param_overrides": dict(state.get("param_overrides", {})),
+            "context_depth_override": state.get("context_depth_override"),
+        }
 
 
 def _stash_messages(session_id: str, messages: List[Dict[str, str]]) -> None:
     """Stash the last N messages from conversation history."""
     with _state_lock:
         state = _get_state(session_id)
-        state["last_messages"] = messages
+        state["last_messages"] = [dict(msg) for msg in messages]
 
 
 def _get_stashed_messages(session_id: str) -> List[Dict[str, str]]:
     """Retrieve stashed messages for a session."""
     with _state_lock:
         state = _get_state(session_id)
-        return state.get("last_messages", [])
+        return [dict(msg) for msg in state.get("last_messages", [])]
+
+
+def _truncate_context_messages(
+    messages: List[Dict[str, str]],
+    context_depth: Any,
+) -> List[Dict[str, str]]:
+    """Return the last ``context_depth`` messages, with 0 disabling context."""
+    try:
+        n = int(context_depth)
+    except (TypeError, ValueError):
+        n = 0
+
+    if n <= 0:
+        return []
+    return messages[-n:] if len(messages) > n else list(messages)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -72,19 +106,13 @@ def _get_stashed_messages(session_id: str) -> List[Dict[str, str]]:
 # ────────────────────────────────────────────────────────────────────────────
 
 
-_base_config_cache = None
-
 def _get_effective_config(session_id: str) -> TalkieRewriterConfig:
     """Return config with runtime overrides applied for this session."""
-    global _base_config_cache
-    if _base_config_cache is None:
-        _base_config_cache = get_config()
-    config = _base_config_cache
-    state = _get_state(session_id)
+    config = get_config()
+    state = _get_state_snapshot(session_id)
 
-    # Create a shallow copy to overlay overrides
-    effective = TalkieRewriterConfig()
-    effective.__dict__.update(config.__dict__)
+    # Create a shallow copy to overlay overrides without re-reading env/config.
+    effective = copy.copy(config)
 
     # Apply runtime overrides
     if state.get("system_prompt_override"):
@@ -111,10 +139,6 @@ def _get_effective_config(session_id: str) -> TalkieRewriterConfig:
 def register(ctx) -> None:
     """Called by the Hermes plugin loader. Registers hooks + tools."""
 
-    # Config is loaded LAZILY on first hook invocation, NOT at register()
-    # time. Calling get_config() / load_config() here interferes with the
-    # agent's auth initialization and causes the model API call to hang.
-
     # ════════════════════════════════════════════════════════════════════════
     # HOOK: pre_llm_call — stash conversation history
     # ════════════════════════════════════════════════════════════════════════
@@ -128,24 +152,28 @@ def register(ctx) -> None:
         if not session_id:
             return None
 
-        # Use hardcoded default — config loading deferred to transform hook
-        n = 4
-
-        # Extract recent user+assistant messages from conversation history
+        # Extract recent user+assistant messages from conversation history.
+        # Do not read plugin config here: this hook runs before the host LLM
+        # call, and it should never delay or perturb the primary model request.
+        # Configured context depth is applied later in transform_llm_output.
         recent = []
         for msg in conversation_history:
             role = msg.get("role", "")
             content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
             if role in ("user", "assistant") and content:
                 recent.append({"role": role, "content": content})
 
-        # Also add the current user message
-        if user_message:
+        # Also add the current user message when Hermes did not already include
+        # it in conversation_history.  Some Hermes call sites pass full current
+        # turn messages here; avoid duplicating the newest user content.
+        if user_message and not (
+            recent
+            and recent[-1].get("role") == "user"
+            and recent[-1].get("content") == user_message
+        ):
             recent.append({"role": "user", "content": user_message})
-
-        # Keep only the last N
-        if len(recent) > n:
-            recent = recent[-n:]
 
         _stash_messages(session_id, recent)
 
@@ -166,8 +194,12 @@ def register(ctx) -> None:
         # Get effective config (with runtime overrides)
         config = _get_effective_config(session_id)
 
-        # Get stashed conversation messages for context
-        context_messages = _get_stashed_messages(session_id)
+        # Get stashed conversation messages for context, then apply the
+        # effective context depth.  Keep the LAST N messages; 0 disables context.
+        context_messages = _truncate_context_messages(
+            _get_stashed_messages(session_id),
+            config.context_messages,
+        )
 
         # Get the last user message (for moderation input)
         last_user_msg = ""
@@ -204,13 +236,9 @@ def register(ctx) -> None:
                 )
 
         # ── Step 2: Rewrite through Talkie model ──
-        # system_prompt_override is only passed if the runtime override changed it
-        # from the base config. Since config already has overrides applied, we
-        # compare against a fresh base load.
         rewritten = rewrite_response(
             original_output=response_text,
             config=config,
-            system_prompt_override=config.system_prompt,
             context_messages=context_messages,
         )
 
@@ -240,7 +268,8 @@ def register(ctx) -> None:
         if not text:
             return json.dumps({"success": False, "error": "No text provided"})
         state = _get_state(session_id)
-        state["system_prompt_override"] = text
+        with _state_lock:
+            state["system_prompt_override"] = text
         logger.info("talkie-rewriter: system prompt updated (session %s)", session_id)
         return json.dumps({"success": True, "message": "System prompt updated", "length": len(text)})
 
@@ -310,7 +339,8 @@ def register(ctx) -> None:
             })
 
         state = _get_state(session_id)
-        state["param_overrides"][param] = coerced
+        with _state_lock:
+            state["param_overrides"][param] = coerced
 
         logger.info("talkie-rewriter: param '%s' set to %s (session %s)", param, coerced, session_id)
         return json.dumps({"success": True, "param": param, "value": coerced})
@@ -359,7 +389,8 @@ def register(ctx) -> None:
         enabled = args.get("enabled", True)
 
         state = _get_state(session_id)
-        state["mod_enabled"] = bool(enabled)
+        with _state_lock:
+            state["mod_enabled"] = bool(enabled)
 
         logger.info(
             "talkie-rewriter: moderation %s (session %s)",
@@ -416,7 +447,8 @@ def register(ctx) -> None:
             return json.dumps({"success": False, "error": "messages must be a non-negative integer"})
 
         state = _get_state(session_id)
-        state["context_depth_override"] = n
+        with _state_lock:
+            state["context_depth_override"] = n
 
         logger.info("talkie-rewriter: context depth set to %d (session %s)", n, session_id)
         return json.dumps({"success": True, "context_messages": n})

@@ -1,3 +1,5 @@
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/gwyntel/talkie-rewriter)
+
 # Talkie Rewriter
 
 Hermes Agent plugin that rewrites LLM responses through a style-flavored finetune model. Designed for weakly pretrained LLMs finetuned on novel datasets to flavor the style of the text.
